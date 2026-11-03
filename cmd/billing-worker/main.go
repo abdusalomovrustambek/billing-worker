@@ -1,0 +1,127 @@
+// Command billing-worker runs billing jobs from the billing.jobs queue.
+// `billing-worker healthcheck` pings the database and exits.
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"os/signal"
+	"strconv"
+	"syscall"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/shop/billing-worker/internal/jobs"
+	"github.com/shop/billing-worker/internal/logging"
+	"github.com/shop/billing-worker/internal/queue"
+	"github.com/shop/billing-worker/migrations"
+)
+
+const healthcheckTimeout = 3 * time.Second
+
+type config struct {
+	DatabaseURL string
+	Workers     int
+	LogLevel    string
+}
+
+func loadConfig() (config, error) {
+	cfg := config{
+		DatabaseURL: os.Getenv("DATABASE_URL"),
+		Workers:     2,
+		LogLevel:    os.Getenv("LOG_LEVEL"),
+	}
+	if cfg.DatabaseURL == "" {
+		return cfg, errors.New("DATABASE_URL is required")
+	}
+	if s := os.Getenv("WORKERS"); s != "" {
+		n, err := strconv.Atoi(s)
+		if err != nil || n < 1 {
+			return cfg, fmt.Errorf("WORKERS must be a positive number, got %q", s)
+		}
+		cfg.Workers = n
+	}
+	return cfg, nil
+}
+
+func main() {
+	var err error
+	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+		err = healthcheck()
+	} else {
+		err = run()
+	}
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "billing-worker:", err)
+		os.Exit(1)
+	}
+}
+
+// healthcheck pings the database. It does not run migrations.
+func healthcheck() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), healthcheckTimeout)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	if err := conn.Ping(ctx); err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+	return nil
+}
+
+func run() error {
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	level, err := logging.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		return fmt.Errorf("LOG_LEVEL: %w", err)
+	}
+	logger := logging.New(os.Stdout, level)
+	mainLog := logging.Component(logger, "billing.main")
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+
+	mainLog.Info("connecting to " + cfg.DatabaseURL)
+	if err := migrations.Up(ctx, cfg.DatabaseURL); err != nil {
+		return err
+	}
+
+	poolCfg, err := pgxpool.ParseConfig(cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("parse DATABASE_URL: %w", err)
+	}
+	// Every worker holds one connection while it runs a job, and a failed job
+	// needs a second transaction on the same connection; the spare
+	// connections keep the pool from running dry.
+	poolCfg.MaxConns = int32(cfg.Workers + 2)
+	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
+	if err != nil {
+		return fmt.Errorf("open pool: %w", err)
+	}
+	defer pool.Close()
+
+	w := &queue.Worker{
+		Pool:     pool,
+		Handlers: jobs.New(logging.Component(logger, "billing.jobs")).Registry(),
+		Count:    cfg.Workers,
+		Log:      logging.Component(logger, "billing.queue"),
+	}
+	mainLog.Info(fmt.Sprintf("started %d workers", cfg.Workers))
+	w.Run(ctx)
+	mainLog.Info("stopped")
+	return nil
+}
