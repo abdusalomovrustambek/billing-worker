@@ -3,10 +3,7 @@ package queue_test
 import (
 	"context"
 	"errors"
-	"io"
-	"log/slog"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +11,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shop/billing-worker/internal/dbtest"
-	"github.com/shop/billing-worker/internal/logging"
 	"github.com/shop/billing-worker/internal/queue"
 )
 
