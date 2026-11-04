@@ -43,7 +43,7 @@ func (h *Handlers) ChargeOrder(ctx context.Context, tx pgx.Tx, raw []byte) error
 	ref, err := cardnet.Charge(ctx, p.Card.Number, p.TotalCents)
 	if err != nil {
 		if errors.Is(err, cardnet.ErrDeclined) {
-			h.Log.Error(fmt.Sprintf("charge declined for order %d", p.OrderID), "payload", string(raw))
+			h.Log.Error(fmt.Sprintf("charge declined for order %d", p.OrderID), "card_last4", cardnet.Last4(p.Card.Number))
 		}
 		return fmt.Errorf("charge order %d: %w", p.OrderID, err)
 	}
