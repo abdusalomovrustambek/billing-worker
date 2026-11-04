@@ -85,6 +85,9 @@ func validateItems(items []Item) error {
 		if it.SKU == "" {
 			return fmt.Errorf("items[%d]: sku is required", i)
 		}
+		if it.Quantity <= 0 {
+			return fmt.Errorf("items[%d]: quantity must be positive", i)
+		}
 	}
 	return nil
 }

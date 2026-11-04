@@ -105,11 +105,18 @@ func (w *Worker) runOne(ctx context.Context) (bool, error) {
 	return true, nil
 }
 
-func (w *Worker) run(ctx context.Context, tx pgx.Tx, job *Job) error {
+func (w *Worker) run(ctx context.Context, tx pgx.Tx, job *Job) (err error) {
 	h, ok := w.Handlers[job.Kind]
 	if !ok {
 		return fmt.Errorf("unknown job kind %q", job.Kind)
 	}
+	// A panicking handler must fail this one attempt, not the whole worker:
+	// runOne rolls the job back and records the failure for any error.
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic: %v", r)
+		}
+	}()
 	if err := h.Run(ctx, tx, job.Payload); err != nil {
 		return err
 	}

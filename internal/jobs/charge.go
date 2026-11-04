@@ -102,7 +102,7 @@ func (h *Handlers) ChargeOrderDead(ctx context.Context, tx pgx.Tx, raw []byte) e
 func checkTotals(p ChargeOrder) error {
 	var sum int64
 	for _, l := range invoice.Lines(invoiceItems(p.Items)) {
-		if l.TotalCents/l.Quantity != l.UnitPriceCents {
+		if l.Quantity <= 0 || l.TotalCents/l.Quantity != l.UnitPriceCents {
 			return fmt.Errorf("sku %s: line total %d does not match unit price %d", l.SKU, l.TotalCents, l.UnitPriceCents)
 		}
 		sum += l.TotalCents
