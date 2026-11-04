@@ -95,7 +95,7 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	mainLog.Info("connecting to database")
+	mainLog.Info("connecting to " + cfg.DatabaseURL)
 	if err := migrations.Up(ctx, cfg.DatabaseURL); err != nil {
 		return err
 	}
