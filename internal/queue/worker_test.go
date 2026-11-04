@@ -109,6 +109,44 @@ func TestWorkerRecordsFailedAttempt(t *testing.T) {
 	}
 }
 
+func TestWorkerRecordsPanickingHandlerAsFailedAttempt(t *testing.T) {
+	pool := dbtest.New(t)
+	panicsID := addJob(t, pool, "panics")
+	okID := addJob(t, pool, "ok")
+
+	handlers := map[string]queue.Handler{
+		"panics": {Run: func(context.Context, pgx.Tx, []byte) error {
+			panic("boom")
+		}},
+		"ok": {Run: func(context.Context, pgx.Tx, []byte) error {
+			return nil
+		}},
+	}
+	w := &queue.Worker{Pool: pool, Handlers: handlers, Count: 2, Log: discardLog()}
+	stop := startWorker(w)
+	defer stop()
+
+	deadline := time.After(10 * time.Second)
+	for {
+		panics := getJob(t, pool, panicsID)
+		ok := getJob(t, pool, okID)
+		if panics.Attempts == 1 && ok.Status == "done" {
+			if panics.Status != "queued" {
+				t.Errorf("panicking job status = %q, want queued", panics.Status)
+			}
+			if panics.LastError == nil || *panics.LastError != "panic: boom" {
+				t.Errorf("panicking job last_error = %v, want %q", panics.LastError, "panic: boom")
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("panicking job = %+v, ok job = %+v, want 1 attempt and done", panics, ok)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 func TestWorkerFailsJobsOfUnknownKind(t *testing.T) {
 	pool := dbtest.New(t)
 	id := addJob(t, pool, "mystery")

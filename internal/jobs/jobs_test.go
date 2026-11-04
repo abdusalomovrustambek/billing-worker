@@ -350,6 +350,17 @@ func TestInvalidPayloadFailsTheAttempt(t *testing.T) {
 		{"missing card", func() any {
 			return chargePayload("")
 		}},
+		{"zero quantity", func() any {
+			p := chargePayload(cardApproved)
+			p.Items[0].Quantity = 0
+			p.SubtotalCents, p.TotalCents = 1990, 1990
+			return p
+		}},
+		{"negative quantity", func() any {
+			p := chargePayload(cardApproved)
+			p.Items[1].Quantity = -2
+			return p
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -371,5 +382,25 @@ func TestInvalidPayloadFailsTheAttempt(t *testing.T) {
 				t.Errorf("order status = %q, want pending", got)
 			}
 		})
+	}
+}
+
+func TestChargeOrderRejectsNonPositiveQuantity(t *testing.T) {
+	for _, qty := range []int64{0, -1} {
+		p := chargePayload(cardApproved)
+		p.Items[0].Quantity = qty
+		if err := p.Validate(); err == nil {
+			t.Errorf("quantity %d: Validate accepted the payload", qty)
+		}
+		next := jobs.ConvertInvoice{
+			OrderID:       p.OrderID,
+			Currency:      p.Currency,
+			Items:         p.Items,
+			SubtotalCents: p.SubtotalCents,
+			TotalCents:    p.TotalCents,
+		}
+		if err := next.Validate(); err == nil {
+			t.Errorf("quantity %d: ConvertInvoice Validate accepted the payload", qty)
+		}
 	}
 }
