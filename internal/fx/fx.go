@@ -22,7 +22,7 @@ func Rate(ctx context.Context, q Querier, currency string) (int64, error) {
 	var ppm int64
 	err := q.QueryRow(ctx, `SELECT rate_ppm FROM billing.fx_rates WHERE currency = $1`, currency).Scan(&ppm)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, nil
+		return 0, fmt.Errorf("unknown currency %s", currency)
 	}
 	if err != nil {
 		return 0, fmt.Errorf("load rate %s: %w", currency, err)

@@ -1,6 +1,13 @@
 package fx
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"strings"
+	"testing"
+
+	"github.com/jackc/pgx/v5"
+)
 
 const (
 	usd = 1_000_000
@@ -45,6 +52,57 @@ func TestConvertDoesNotOverflow(t *testing.T) {
 	}
 	if want := int64(2_000_000_000_000_000_000); got != want {
 		t.Errorf("got %d, want %d", got, want)
+	}
+}
+
+// stubQuerier returns a fixed Scan result for the rate lookup, so Rate can
+// be tested without a database.
+type stubQuerier struct {
+	ppm int64
+	err error
+}
+
+// stubRateRow scans the stubbed rate answer of the fx_rates lookup.
+type stubRateRow struct {
+	ppm int64
+	err error
+}
+
+func (q stubQuerier) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row {
+	return stubRateRow(q)
+}
+
+func (r stubRateRow) Scan(dest ...any) error {
+	if r.err != nil {
+		return r.err
+	}
+	ppm, ok := dest[0].(*int64)
+	if !ok || len(dest) != 1 {
+		return errors.New("stub row scans one *int64")
+	}
+	*ppm = r.ppm
+	return nil
+}
+
+func TestRateKnownCurrency(t *testing.T) {
+	got, err := Rate(context.Background(), stubQuerier{ppm: eur}, "EUR")
+	if err != nil {
+		t.Fatalf("Rate(EUR): %v", err)
+	}
+	if got != eur {
+		t.Errorf("Rate(EUR) = %d, want %d", got, eur)
+	}
+}
+
+func TestRateUnknownCurrency(t *testing.T) {
+	// An unseeded currency must come back as an error, not as a zero rate:
+	// a zero rate converts every amount to 0 with no error.
+	rate, err := Rate(context.Background(), stubQuerier{err: pgx.ErrNoRows}, "UZS")
+	if err == nil {
+		t.Fatalf("Rate(UZS) = %d, want an unknown-currency error", rate)
+	}
+	if !strings.Contains(err.Error(), "UZS") {
+		t.Errorf("Rate(UZS) error = %q, want it to name the currency", err)
 	}
 }
 
