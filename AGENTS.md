@@ -10,6 +10,7 @@ A Go worker that takes jobs from a PostgreSQL queue (schema `billing`), charges 
 - DB tests need `BILLING_TEST_DATABASE_URL`, for example `postgres://billing:billing@localhost:5432/billing_test?sslmode=disable`. Without it they are skipped.
 - Config comes from the environment: `DATABASE_URL` (required), `WORKERS` (default 2), `LOG_LEVEL` (debug, info, warn, error; default info).
 - `billing-worker healthcheck` pings the database (3 s timeout) and sets the exit code. It does not run migrations.
+- `billing-worker purge-cards [--older-than DURATION]` strips card numbers from finished `charge_order` payloads (default `720h`, i.e. 30 days) and reports how many rows it stripped. Run it once at rollout; it takes `DATABASE_URL` like the other commands and does not run migrations.
 
 ## Layout
 

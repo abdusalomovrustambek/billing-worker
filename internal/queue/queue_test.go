@@ -2,7 +2,9 @@ package queue_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -323,5 +325,201 @@ func TestClosedConnectionLeavesJobQueued(t *testing.T) {
 	}
 	if enqueued != 0 {
 		t.Errorf("%d convert_invoice jobs survived the rollback, want 0", enqueued)
+	}
+}
+
+// chargePayloadWithCard is a charge_order payload as shop-api inserts it: the
+// full card travels in billing.jobs.payload while the job runs.
+const chargePayloadWithCard = `{"order_id":812,"user_id":7,"currency":"EUR","subtotal_cents":3000,"discount_cents":0,"total_cents":3000,"card":{"number":"4242424242424242","exp":"12/29","cvc":"123"}}`
+
+func addJobWithPayload(t *testing.T, pool *pgxpool.Pool, kind, payload string) int64 {
+	t.Helper()
+	var id int64
+	err := pool.QueryRow(context.Background(),
+		`INSERT INTO billing.jobs (kind, payload) VALUES ($1, $2) RETURNING id`, kind, payload).Scan(&id)
+	if err != nil {
+		t.Fatalf("insert job: %v", err)
+	}
+	return id
+}
+
+func getPayload(t *testing.T, pool *pgxpool.Pool, id int64) []byte {
+	t.Helper()
+	var payload []byte
+	err := pool.QueryRow(context.Background(),
+		`SELECT payload FROM billing.jobs WHERE id = $1`, id).Scan(&payload)
+	if err != nil {
+		t.Fatalf("select payload of job %d: %v", id, err)
+	}
+	return payload
+}
+
+// A finished charge_order must not keep the card: the card is never stored,
+// only card_last4 in billing.charges.
+func TestCompleteStripsCardFromChargeOrderPayload(t *testing.T) {
+	pool := dbtest.New(t)
+	id := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	ctx := context.Background()
+
+	tx, job, err := queue.Claim(ctx, acquire(t, pool))
+	if err != nil || job == nil {
+		t.Fatalf("Claim = %v, %v", job, err)
+	}
+	// While the job runs the handler still needs the card.
+	if !strings.Contains(string(job.Payload), "4242424242424242") {
+		t.Errorf("claimed payload = %s, want it to still carry the card", job.Payload)
+	}
+	if err := queue.Complete(ctx, tx, job.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	if got := getJob(t, pool, id).Status; got != "done" {
+		t.Errorf("status = %q, want done", got)
+	}
+	payload := getPayload(t, pool, id)
+	if strings.Contains(string(payload), "4242424242424242") {
+		t.Errorf("completed payload = %s, want no full card number", payload)
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(payload, &decoded); err != nil {
+		t.Fatalf("decode completed payload: %v", err)
+	}
+	if _, ok := decoded["card"]; ok {
+		t.Errorf("completed payload = %s, want the card object removed", payload)
+	}
+	if decoded["order_id"] != float64(812) {
+		t.Errorf("completed payload = %s, want the order data kept", payload)
+	}
+}
+
+// Other kinds carry no card, so completing them must leave the payload alone.
+func TestCompleteKeepsOtherKindPayloads(t *testing.T) {
+	pool := dbtest.New(t)
+	id := addJobWithPayload(t, pool, "convert_invoice", `{"order_id":1,"currency":"EUR","total_cents":3000}`)
+	ctx := context.Background()
+
+	tx, job, err := queue.Claim(ctx, acquire(t, pool))
+	if err != nil || job == nil {
+		t.Fatalf("Claim = %v, %v", job, err)
+	}
+	if err := queue.Complete(ctx, tx, job.ID); err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+
+	var decoded map[string]any
+	if err := json.Unmarshal(getPayload(t, pool, id), &decoded); err != nil {
+		t.Fatalf("decode completed payload: %v", err)
+	}
+	if decoded["order_id"] != float64(1) || decoded["total_cents"] != float64(3000) {
+		t.Errorf("completed payload = %v, want it unchanged", decoded)
+	}
+}
+
+// A charge_order that runs out of attempts goes dead with its card stripped,
+// while retryable failures and other kinds keep their payloads.
+func TestFailStripsCardWhenChargeOrderGoesDead(t *testing.T) {
+	pool := dbtest.New(t)
+	ctx := context.Background()
+	fail := func(id int64, kind string) (bool, error) {
+		return queue.Fail(ctx, acquire(t, pool), &queue.Job{ID: id, Kind: kind}, errors.New("card declined"), nil)
+	}
+	failOnLastAttempt := func(t *testing.T, id int64) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE billing.jobs SET attempts = $2 WHERE id = $1`, id, queue.MaxAttempts-1); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	dying := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	failOnLastAttempt(t, dying)
+	dead, err := fail(dying, "charge_order")
+	if err != nil {
+		t.Fatalf("Fail: %v", err)
+	}
+	if !dead {
+		t.Fatal("Fail did not report the job dead")
+	}
+	if got := getJob(t, pool, dying).Status; got != "dead" {
+		t.Fatalf("status = %q, want dead", got)
+	}
+	if stripped := getPayload(t, pool, dying); strings.Contains(string(stripped), "4242424242424242") {
+		t.Errorf("dead payload = %s, want no full card number", stripped)
+	}
+
+	// A retryable failure keeps the card: the next attempt still needs it.
+	retry := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	if dead, err := fail(retry, "charge_order"); err != nil {
+		t.Fatalf("Fail: %v", err)
+	} else if dead {
+		t.Fatal("first Fail reported the job dead")
+	}
+	if kept := getPayload(t, pool, retry); !strings.Contains(string(kept), "4242424242424242") {
+		t.Errorf("retried payload = %s, want the card kept for the next attempt", kept)
+	}
+
+	// Other kinds keep their payloads even when they go dead.
+	other := addJobWithPayload(t, pool, "convert_invoice", `{"order_id":1,"currency":"EUR","total_cents":3000}`)
+	failOnLastAttempt(t, other)
+	if dead, err := fail(other, "convert_invoice"); err != nil {
+		t.Fatalf("Fail: %v", err)
+	} else if !dead {
+		t.Fatal("Fail did not report the job dead")
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(getPayload(t, pool, other), &decoded); err != nil {
+		t.Fatalf("decode dead convert_invoice payload: %v", err)
+	}
+	if decoded["order_id"] != float64(1) || decoded["total_cents"] != float64(3000) {
+		t.Errorf("dead convert_invoice payload = %v, want it unchanged", decoded)
+	}
+}
+
+// The retention purge strips the card from finished charge_order jobs older
+// than the cutoff and leaves everything else alone.
+func TestPurgeFinishedPayloadsStripsOnlyOldFinishedChargeOrders(t *testing.T) {
+	pool := dbtest.New(t)
+	ctx := context.Background()
+
+	oldDone := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	oldDead := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	newDone := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	queued := addJobWithPayload(t, pool, "charge_order", chargePayloadWithCard)
+	other := addJobWithPayload(t, pool, "convert_invoice", `{"order_id":1,"currency":"EUR","total_cents":3000}`)
+	backdate := func(id int64, status string) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `UPDATE billing.jobs SET status = $2, attempts = $3, updated_at = now() - interval '60 days' WHERE id = $1`,
+			id, status, queue.MaxAttempts); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backdate(oldDone, "done")
+	backdate(oldDead, "dead")
+	if _, err := pool.Exec(ctx, `UPDATE billing.jobs SET status = 'done' WHERE id = $1`, newDone); err != nil {
+		t.Fatal(err)
+	}
+
+	purged, err := queue.PurgeFinishedPayloads(ctx, pool, time.Now().Add(-30*24*time.Hour))
+	if err != nil {
+		t.Fatalf("PurgeFinishedPayloads: %v", err)
+	}
+	if purged != 2 {
+		t.Errorf("purged %d rows, want 2", purged)
+	}
+	for _, id := range []int64{oldDone, oldDead} {
+		if payload := getPayload(t, pool, id); strings.Contains(string(payload), "4242424242424242") {
+			t.Errorf("purged payload of job %d = %s, want no full card number", id, payload)
+		}
+	}
+	for _, id := range []int64{newDone, queued} {
+		if payload := getPayload(t, pool, id); !strings.Contains(string(payload), "4242424242424242") {
+			t.Errorf("payload of job %d = %s, want the card kept", id, payload)
+		}
+	}
+	var decoded map[string]any
+	if err := json.Unmarshal(getPayload(t, pool, other), &decoded); err != nil {
+		t.Fatalf("decode convert_invoice payload: %v", err)
+	}
+	if decoded["order_id"] != float64(1) || decoded["total_cents"] != float64(3000) {
+		t.Errorf("convert_invoice payload = %v, want it unchanged", decoded)
 	}
 }

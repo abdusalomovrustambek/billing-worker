@@ -9,8 +9,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 )
 
 // MaxAttempts is the number of failures after which a job is dead.
@@ -19,6 +21,11 @@ const MaxAttempts = 5
 // Beginner is satisfied by *pgx.Conn and *pgxpool.Conn.
 type Beginner interface {
 	Begin(ctx context.Context) (pgx.Tx, error)
+}
+
+// Execer is satisfied by *pgxpool.Pool, *pgxpool.Conn and pgx.Tx.
+type Execer interface {
+	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 }
 
 // Job is a claimed row of billing.jobs.
@@ -62,9 +69,12 @@ func Claim(ctx context.Context, conn Beginner) (pgx.Tx, *Job, error) {
 }
 
 // Complete marks the job done and commits the job's transaction, together
-// with everything the handler wrote in it.
+// with everything the handler wrote in it. For charge_order jobs it also
+// strips the card from the stored payload: the card is never stored, only
+// card_last4 in billing.charges. The kind stays a literal because jobs
+// imports queue, and the shop-api contract names it in AGENTS.md.
 func Complete(ctx context.Context, tx pgx.Tx, id int64) error {
-	if _, err := tx.Exec(ctx, `UPDATE billing.jobs SET status = 'done', updated_at = now() WHERE id = $1`, id); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE billing.jobs SET status = 'done', payload = CASE WHEN kind = 'charge_order' THEN payload - 'card' ELSE payload END, updated_at = now() WHERE id = $1`, id); err != nil {
 		return fmt.Errorf("mark job %d done: %w", id, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -88,8 +98,10 @@ func Enqueue(ctx context.Context, tx pgx.Tx, kind string, payload any) error {
 // Fail records a failed run in a second short transaction on conn, after the
 // job's own transaction was rolled back: attempts + 1, the error, and the
 // next run in 2^attempts seconds. On the MaxAttempts-th failure the job
-// becomes dead and onDead, if set, runs in the same transaction. It reports
-// whether the job is dead now.
+// becomes dead and onDead, if set, runs in the same transaction. A dead
+// charge_order loses its card with the dead flip, the same guarantee as
+// Complete; retryable failures keep the payload so the next attempt can run.
+// It reports whether the job is dead now.
 func Fail(ctx context.Context, conn Beginner, job *Job, jobErr error, onDead DeadFunc) (bool, error) {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
@@ -104,6 +116,7 @@ func Fail(ctx context.Context, conn Beginner, job *Job, jobErr error, onDead Dea
 		       last_error = $2,
 		       run_after  = now() + interval '1 second' * power(2, attempts + 1),
 		       status     = CASE WHEN attempts + 1 >= $3 THEN 'dead' ELSE status END,
+		       payload    = CASE WHEN attempts + 1 >= $3 AND kind = 'charge_order' THEN payload - 'card' ELSE payload END,
 		       updated_at = now()
 		 WHERE id = $1
 		RETURNING status`, job.ID, jobErr.Error(), MaxAttempts).Scan(&status)
@@ -120,4 +133,22 @@ func Fail(ctx context.Context, conn Beginner, job *Job, jobErr error, onDead Dea
 		return false, fmt.Errorf("commit failure of job %d: %w", job.ID, err)
 	}
 	return dead, nil
+}
+
+// PurgeFinishedPayloads strips the card from finished charge_order jobs last
+// updated before before. It backfills rows finished before Complete and Fail
+// learned to redact, and bounds how long a card survives in any row the
+// redaction missed. It reports how many rows it stripped.
+func PurgeFinishedPayloads(ctx context.Context, db Execer, before time.Time) (int64, error) {
+	tag, err := db.Exec(ctx, `
+		UPDATE billing.jobs
+		   SET payload = payload - 'card', updated_at = now()
+		 WHERE kind = 'charge_order'
+		   AND status IN ('done', 'dead')
+		   AND updated_at < $1
+		   AND payload ? 'card'`, before)
+	if err != nil {
+		return 0, fmt.Errorf("purge finished payloads: %w", err)
+	}
+	return tag.RowsAffected(), nil
 }

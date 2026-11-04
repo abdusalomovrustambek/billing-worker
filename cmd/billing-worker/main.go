@@ -1,14 +1,17 @@
 // Command billing-worker runs billing jobs from the billing.jobs queue.
 // `billing-worker healthcheck` pings the database and exits.
+// `billing-worker purge-cards` strips card numbers from finished job payloads.
 package main
 
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -22,6 +25,9 @@ import (
 )
 
 const healthcheckTimeout = 3 * time.Second
+
+// purgeTimeout bounds the one-off purge-cards run.
+const purgeTimeout = 30 * time.Second
 
 type config struct {
 	DatabaseURL string
@@ -50,9 +56,12 @@ func loadConfig() (config, error) {
 
 func main() {
 	var err error
-	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
+	switch {
+	case len(os.Args) > 1 && os.Args[1] == "healthcheck":
 		err = healthcheck()
-	} else {
+	case len(os.Args) > 1 && os.Args[1] == "purge-cards":
+		err = purgeCards(os.Args[2:])
+	default:
 		err = run()
 	}
 	if err != nil {
@@ -77,6 +86,63 @@ func healthcheck() error {
 	if err := conn.Ping(ctx); err != nil {
 		return fmt.Errorf("ping: %w", err)
 	}
+	return nil
+}
+
+// defaultPurgeOlderThan strips cards from finished jobs last updated over 30
+// days ago.
+const defaultPurgeOlderThan = 720 * time.Hour
+
+// parsePurgeArgs parses the purge-cards arguments. It takes no database.
+func parsePurgeArgs(args []string) (time.Duration, error) {
+	fs := flag.NewFlagSet("purge-cards", flag.ContinueOnError)
+	fs.SetOutput(os.Stderr)
+	olderThan := fs.Duration("older-than", defaultPurgeOlderThan, "strip cards from finished jobs last updated longer ago")
+	if err := fs.Parse(args); err != nil {
+		return 0, err
+	}
+	if fs.NArg() > 0 {
+		return 0, fmt.Errorf("unexpected arguments: %s", strings.Join(fs.Args(), " "))
+	}
+	if *olderThan < 0 {
+		return 0, fmt.Errorf("older-than must not be negative, got %q", olderThan.String())
+	}
+	return *olderThan, nil
+}
+
+// purgeCards strips card numbers from finished job payloads older than the
+// cutoff: the one-off rollout for rows finished before Complete and Fail
+// learned to redact.
+func purgeCards(args []string) error {
+	olderThan, err := parsePurgeArgs(args)
+	if err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil
+		}
+		return err
+	}
+	cfg, err := loadConfig()
+	if err != nil {
+		return err
+	}
+	level, err := logging.ParseLevel(cfg.LogLevel)
+	if err != nil {
+		return fmt.Errorf("LOG_LEVEL: %w", err)
+	}
+	mainLog := logging.Component(logging.New(os.Stdout, level), "billing.main")
+
+	ctx, cancel := context.WithTimeout(context.Background(), purgeTimeout)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	purged, err := queue.PurgeFinishedPayloads(ctx, conn, time.Now().Add(-olderThan))
+	if err != nil {
+		return err
+	}
+	mainLog.Info(fmt.Sprintf("purged %d finished payloads older than %s", purged, olderThan), "purged", purged)
 	return nil
 }
 
