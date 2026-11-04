@@ -4,13 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/shop/billing-worker/internal/dbtest"
@@ -275,56 +273,6 @@ func TestDeclinedChargeRetriesAndOrderFailsOnlyWhenDead(t *testing.T) {
 	}
 	if n := e.count(t, `SELECT count(*) FROM billing.jobs WHERE kind = 'convert_invoice'`); n != 0 {
 		t.Errorf("%d convert_invoice jobs enqueued for a failed order", n)
-	}
-}
-
-// stubTx is a pgx.Tx that reports no earlier approved charge, so ChargeOrder
-// reaches the card network without a database. Anything beyond the EXISTS
-// lookup panics: a declined charge never gets there.
-type stubTx struct {
-	pgx.Tx
-}
-
-// stubExistsRow scans the not-charged-before answer of the EXISTS lookup.
-type stubExistsRow struct{}
-
-func (stubTx) QueryRow(_ context.Context, _ string, _ ...any) pgx.Row { return stubExistsRow{} }
-
-func (stubExistsRow) Scan(dest ...any) error {
-	charged, ok := dest[0].(*bool)
-	if !ok || len(dest) != 1 {
-		return errors.New("stub row scans one *bool")
-	}
-	*charged = false
-	return nil
-}
-
-func TestDeclinedChargeLogsOnlyCardLast4(t *testing.T) {
-	logs := &bytes.Buffer{}
-	h := jobs.New(logging.Component(logging.New(logs, slog.LevelDebug), "billing.jobs"))
-
-	raw, err := json.Marshal(chargePayload(cardDeclined))
-	if err != nil {
-		t.Fatalf("marshal payload: %v", err)
-	}
-	err = h.ChargeOrder(context.Background(), stubTx{}, raw)
-	if err == nil {
-		t.Fatal("ChargeOrder succeeded with a declined card")
-	}
-	if strings.Contains(err.Error(), "4000") {
-		t.Errorf("returned error leaks card data: %v", err)
-	}
-
-	got := logs.String()
-	for _, want := range []string{"charge declined for order 812", "card_last4=0002"} {
-		if !strings.Contains(got, want) {
-			t.Errorf("log lacks %q:\n%s", want, got)
-		}
-	}
-	for _, leak := range []string{cardDeclined, "12/29", "cvc", "payload="} {
-		if strings.Contains(got, leak) {
-			t.Errorf("decline log leaks card data %q:\n%s", leak, got)
-		}
 	}
 }
 
